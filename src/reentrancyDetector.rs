@@ -65,42 +65,7 @@ where
         Ok(vec![])
     }
 
-    async fn debug_trace_with_block_hash(
-        &self,
-        block_hash: BlockHash,
-        option: GethDebugTracingOptions,
-    ) -> Result<(Vec<CallFrame>, Vec<TxHash>), Box<dyn std::error::Error>> {
-        let mut res = Vec::<CallFrame>::new();
-        let mut err_tx = Vec::<TxHash>::new();
-        match self
-            .provider
-            .debug_trace_block_by_hash(block_hash, option.clone())
-            .await
-        {
-            // 解构call_tracer
-            Ok(trace_info) => {
-                for call_trace in trace_info {
-                    match call_trace {
-                        TraceResult::Success { result, tx_hash } => match result {
-                            GethTrace::CallTracer(call) => {
-                                res.push(call);
-                            }
-                            _ => {}
-                        },
-                        TraceResult::Error { error, tx_hash } => {
-                            if tx_hash.is_some() {
-                                err_tx.push(tx_hash.unwrap());
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {}
-        };
-        Ok((res, err_tx))
-    }
-
-    pub async fn detect(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn detect_block(&self) -> Result<(), Box<dyn std::error::Error>> {
         // 轮询区块头
         let subscrible_stream = self.provider.watch_blocks().await?;
         let mut stream = subscrible_stream
@@ -114,7 +79,6 @@ where
         // 有新的区块
         while let Some(block_hash) = stream.next().await {
             println!("block_hash:{:?}", block_hash);
-
             match self
                 .provider
                 .debug_trace_block_by_hash(block_hash, option.clone())
@@ -127,11 +91,25 @@ where
                             TraceResult::Success { result, tx_hash } => match result {
                                 GethTrace::CallTracer(call) => {
                                     // 获取可能出现重入的地址
-                                    let res = self.get_reenter_address(call);
-                                    // 告警
-                                    if !res.is_empty() {
-                                        println!("alert!!! => {:?}", tx_hash);
-                                        println!("notice address => {:?}", res);
+                                    let address_list: Vec<Address> = self
+                                        .get_reenter_address(call)
+                                        .iter()
+                                        .map(|s| {
+                                            s.parse::<Address>().expect("Invalid address format")
+                                        })
+                                        .collect();
+                                    if !address_list.is_empty() {
+                                        // 获取每个地址的获利情况
+                                        let reenter_address_profit = self
+                                            .cacl_balance_change(tx_hash.unwrap(), address_list)
+                                            .await?;
+                                        // 根据获利情况告警
+                                        for (address, profit) in reenter_address_profit {
+                                            if profit.lt(&I256::ZERO) {
+                                                println!("alert!!! => {:?}", address);
+                                                println!("balance decrease {:?}", profit);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -148,11 +126,12 @@ where
         Ok(())
     }
 
-    pub async fn cacl_balance_change(
+    async fn cacl_balance_change(
         &self,
         tx_hash: TxHash,
-    ) -> Result<BlockSecResponse, Box<dyn std::error::Error>> {
-        // @description:获取计算余额变化
+        address_list: Vec<Address>,
+    ) -> Result<Vec<AddressProfit>, Box<dyn std::error::Error>> {
+        // @description:获取地址余额变化
         let client = reqwest::Client::new();
         let mut header_map = HeaderMap::new();
         header_map.insert("accept", HeaderValue::from_str("application/json").unwrap());
@@ -174,27 +153,33 @@ where
             .text()
             .await?;
         let balance_change: BlockSecResponse = serde_json::from_str(&balance_change_json).unwrap();
-        self.handle_balance_change(balance_change.clone());
-        Ok(balance_change)
+        println!("{:?}", balance_change);
+        Ok(self.handle_balance_change(balance_change.clone(), address_list))
     }
-    pub fn handle_balance_change(&self, balance_changes: BlockSecResponse) -> Vec<AddressProfit> {
+    fn handle_balance_change(
+        &self,
+        balance_changes: BlockSecResponse,
+        address_list: Vec<Address>,
+    ) -> Vec<AddressProfit> {
         let mut address_profit = Vec::<AddressProfit>::new();
         for balance_change in balance_changes.balance_changes {
             for asset in balance_change.assets {
-                let mut res = I256::ZERO;
-                let amount_fragment = if asset.amount.contains(".") {
-                    asset.amount.split_once(".").unwrap().0.to_string()
-                } else {
-                    asset.amount
-                };
-                let amount_fragment: Vec<&str> = amount_fragment.split(',').collect();
-                let amount = amount_fragment.join("");
-                if asset.sign {
-                    res += I256::from_str(&amount).unwrap();
-                } else {
-                    res -= I256::from_str(&amount).unwrap();
+                if address_list.contains(&asset.address) {
+                    let mut res = I256::ZERO;
+                    let amount_fragment = if asset.amount.contains(".") {
+                        asset.amount.split_once(".").unwrap().0.to_string()
+                    } else {
+                        asset.amount
+                    };
+                    let amount_fragment: Vec<&str> = amount_fragment.split(',').collect();
+                    let amount = amount_fragment.join("");
+                    if asset.sign {
+                        res += I256::from_str(&amount).unwrap();
+                    } else {
+                        res -= I256::from_str(&amount).unwrap();
+                    }
+                    address_profit.push((asset.address, res));
                 }
-                address_profit.push((asset.address, res));
             }
         }
         address_profit
@@ -306,5 +291,39 @@ where
         } else {
             None
         }
+    }
+    async fn debug_trace_with_block_hash(
+        &self,
+        block_hash: BlockHash,
+        option: GethDebugTracingOptions,
+    ) -> Result<(Vec<CallFrame>, Vec<TxHash>), Box<dyn std::error::Error>> {
+        let mut res = Vec::<CallFrame>::new();
+        let mut err_tx = Vec::<TxHash>::new();
+        match self
+            .provider
+            .debug_trace_block_by_hash(block_hash, option.clone())
+            .await
+        {
+            // 解构call_tracer
+            Ok(trace_info) => {
+                for call_trace in trace_info {
+                    match call_trace {
+                        TraceResult::Success { result, tx_hash } => match result {
+                            GethTrace::CallTracer(call) => {
+                                res.push(call);
+                            }
+                            _ => {}
+                        },
+                        TraceResult::Error { error, tx_hash } => {
+                            if tx_hash.is_some() {
+                                err_tx.push(tx_hash.unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {}
+        };
+        Ok((res, err_tx))
     }
 }

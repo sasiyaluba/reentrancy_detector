@@ -14,12 +14,5 @@ async fn main() {
     // 实例化检测器
     let detector = ReentrancyDetector::new(ws_provider, WHITE_LIST.clone());
     // 检测
-    // let _ = detector.detect().await;
-    let balance_change = detector
-        .cacl_balance_change(
-            TxHash::from_str("0x6bfd9e286e37061ed279e4f139fbc03c8bd707a2cdd15f7260549052cbba79b7")
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let _ = detector.detect_block().await;
 }
