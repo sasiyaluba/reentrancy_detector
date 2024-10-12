@@ -1,10 +1,9 @@
-use std::{process::id, str::FromStr, sync::Arc};
-
+use crate::constants::WHITE_LIST;
 use alloy::{
     hex::{self, FromHex},
     json_abi::Items,
-    primitives::{map::HashSet, Address, Bytes, Selector},
-    providers::{ext::DebugApi, Provider, RootProvider},
+    primitives::{map::HashSet, Address, BlockHash, Bytes, Selector, TxHash, I256, U256},
+    providers::{ext::DebugApi, Provider, ProviderBuilder, RootProvider, WsConnect},
     rpc::types::trace::geth::{
         CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
         GethTrace, TraceResult,
@@ -12,7 +11,9 @@ use alloy::{
     transports::Transport,
 };
 use futures::StreamExt;
-
+use reqwest::header::{HeaderMap, HeaderValue};
+use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 /**
  * @description:下面是测试中失败的交易，考虑这些重入漏洞不是单函数重入
  * *测试来源：重入合集=>https://github.com/pcaversaccio/reentrancy-attacks?tab=readme-ov-file
@@ -23,11 +24,29 @@ use futures::StreamExt;
 // 0xfa97c3476aa8aeac662dae0cc3f0d3da48472ff4e7c55d0e305901ec37a2f704 rpcerror
 // 0xadbe5cf9269a001d50990d0c29075b402bcc3a0b0f3258821881621b787b35c6 FeiProtocol-Fuse cannot
  */
-
+type Path = Vec<String>;
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct BalanceChange {
+    account: String,
+    assets: Vec<Asset>,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Asset {
+    address: Address,
+    amount: String,
+    sign: bool,
+    value: String,
+}
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BlockSecResponse {
+    #[serde(rename = "balanceChanges")]
+    balance_changes: Vec<BalanceChange>,
+}
 pub struct ReentrancyDetector<T> {
     provider: RootProvider<T>,
     white_list: Vec<String>,
 }
+pub type AddressProfit = (Address, I256);
 impl<T> ReentrancyDetector<T>
 where
     T: Transport + Clone,
@@ -38,9 +57,52 @@ where
             white_list,
         }
     }
-    pub async fn detect(&self) {
+
+    pub async fn detect_tx(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Vec<Address>, Box<dyn std::error::Error>> {
+        Ok(vec![])
+    }
+
+    async fn debug_trace_with_block_hash(
+        &self,
+        block_hash: BlockHash,
+        option: GethDebugTracingOptions,
+    ) -> Result<(Vec<CallFrame>, Vec<TxHash>), Box<dyn std::error::Error>> {
+        let mut res = Vec::<CallFrame>::new();
+        let mut err_tx = Vec::<TxHash>::new();
+        match self
+            .provider
+            .debug_trace_block_by_hash(block_hash, option.clone())
+            .await
+        {
+            // 解构call_tracer
+            Ok(trace_info) => {
+                for call_trace in trace_info {
+                    match call_trace {
+                        TraceResult::Success { result, tx_hash } => match result {
+                            GethTrace::CallTracer(call) => {
+                                res.push(call);
+                            }
+                            _ => {}
+                        },
+                        TraceResult::Error { error, tx_hash } => {
+                            if tx_hash.is_some() {
+                                err_tx.push(tx_hash.unwrap());
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {}
+        };
+        Ok((res, err_tx))
+    }
+
+    pub async fn detect(&self) -> Result<(), Box<dyn std::error::Error>> {
         // 轮询区块头
-        let subscrible_stream = self.provider.watch_blocks().await.unwrap();
+        let subscrible_stream = self.provider.watch_blocks().await?;
         let mut stream = subscrible_stream
             .into_stream()
             .flat_map(futures::stream::iter);
@@ -52,6 +114,7 @@ where
         // 有新的区块
         while let Some(block_hash) = stream.next().await {
             println!("block_hash:{:?}", block_hash);
+
             match self
                 .provider
                 .debug_trace_block_by_hash(block_hash, option.clone())
@@ -64,7 +127,8 @@ where
                             TraceResult::Success { result, tx_hash } => match result {
                                 GethTrace::CallTracer(call) => {
                                     // 获取可能出现重入的地址
-                                    let res = self.get_reentrancy(call);
+                                    let res = self.get_reenter_address(call);
+                                    // 告警
                                     if !res.is_empty() {
                                         println!("alert!!! => {:?}", tx_hash);
                                         println!("notice address => {:?}", res);
@@ -73,7 +137,7 @@ where
                                 _ => {}
                             },
                             TraceResult::Error { error, tx_hash } => {
-                                // todo 此处应当再处理
+                                // return Err(error.into());
                             }
                         }
                     }
@@ -81,9 +145,61 @@ where
                 Err(e) => {}
             }
         }
+        Ok(())
     }
 
-    fn get_reentrancy(&self, call_trace: CallFrame) -> Vec<String> {
+    pub async fn cacl_balance_change(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<BlockSecResponse, Box<dyn std::error::Error>> {
+        // @description:获取计算余额变化
+        let client = reqwest::Client::new();
+        let mut header_map = HeaderMap::new();
+        header_map.insert("accept", HeaderValue::from_str("application/json").unwrap());
+        header_map.insert(
+            "accept-language",
+            HeaderValue::from_str("zh-CN,zh;q=0.9").unwrap(),
+        );
+        header_map.insert(
+            "content-type",
+            HeaderValue::from_str("application/json;charset=utf-8").unwrap(),
+        );
+        let body_data = format!(r#"{{"chainID":1,"txnHash":"{}","blocked":false}}"#, tx_hash);
+        let balance_change_json = client
+            .post("https://app.blocksec.com/api/v1/onchain/tx/balance-change")
+            .headers(header_map)
+            .body(body_data)
+            .send()
+            .await?
+            .text()
+            .await?;
+        let balance_change: BlockSecResponse = serde_json::from_str(&balance_change_json).unwrap();
+        self.handle_balance_change(balance_change.clone());
+        Ok(balance_change)
+    }
+    pub fn handle_balance_change(&self, balance_changes: BlockSecResponse) -> Vec<AddressProfit> {
+        let mut address_profit = Vec::<AddressProfit>::new();
+        for balance_change in balance_changes.balance_changes {
+            for asset in balance_change.assets {
+                let mut res = I256::ZERO;
+                let amount_fragment = if asset.amount.contains(".") {
+                    asset.amount.split_once(".").unwrap().0.to_string()
+                } else {
+                    asset.amount
+                };
+                let amount_fragment: Vec<&str> = amount_fragment.split(',').collect();
+                let amount = amount_fragment.join("");
+                if asset.sign {
+                    res += I256::from_str(&amount).unwrap();
+                } else {
+                    res -= I256::from_str(&amount).unwrap();
+                }
+                address_profit.push((asset.address, res));
+            }
+        }
+        address_profit
+    }
+    fn get_reenter_address(&self, call_trace: CallFrame) -> Vec<String> {
         //@description:获得所有被重入的地址
         let mut reentrances = Vec::<String>::new();
         // 对call_trace进行dfs，得到所有的调用路径
@@ -104,7 +220,6 @@ where
         }
         reentrances
     }
-
     fn get_exclude_address(&self, path: Vec<String>) -> Vec<String> {
         //@description:将包含在白名单中的项从path中排除
         let mut to_remove = Vec::<usize>::new();
@@ -193,4 +308,3 @@ where
         }
     }
 }
-type Path = Vec<String>;
