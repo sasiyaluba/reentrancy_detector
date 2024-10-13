@@ -8,12 +8,13 @@ use alloy::{
         CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
         GethTrace, TraceResult,
     },
+    signers::k256::elliptic_curve::rand_core::le,
     transports::Transport,
 };
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use std::{collections::VecDeque, str::FromStr};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, str::FromStr, sync::Arc, time};
 
 type Path = Vec<String>;
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -99,6 +100,7 @@ where
         // 有新的区块
         while let Some(block_hash) = stream.next().await {
             println!("new block");
+            let start = time::Instant::now();
             let trace_info = self
                 .provider
                 .debug_trace_block_by_hash(block_hash, CALLTRACE_OPTION.clone())
@@ -114,7 +116,7 @@ where
                             // 找出所有盈利的地址，如果盈利超过最小盈利限制，则告警
                             let profits = address_profit
                                 .into_iter()
-                                .filter(|(_, profit)| profit.gt(&MIN_LOSS))
+                                .filter(|(_, profit)| profit.lt(&MIN_LOSS))
                                 .collect::<Vec<AddressProfit>>();
                             for profit in profits {
                                 println!("ALERT!!!");
@@ -130,6 +132,8 @@ where
                     }
                 }
             }
+            let end = time::Instant::now();
+            println!("time:{:?}", end - start);
         }
         Ok(())
     }
@@ -212,9 +216,9 @@ where
         }
         // 第二次过滤：在calltrace中同一子树的同一层找到重入，使用BFS实现
         // !注意，此处可能存在较高误报率
-        if reenter_list.is_empty() {
-            reenter_list.extend(Self::get_reenter_on_same_depth(call_trace));
-        }
+        // if reenter_list.is_empty() {
+        //     reenter_list.extend(Self::get_reenter_on_same_depth(call_trace));
+        // }
         reenter_list
     }
 
@@ -223,7 +227,6 @@ where
      * @param:path代表路径，路径的形式为"selector,address"
      */
     fn get_exclude_address(&self, path: Vec<String>) -> Vec<String> {
-        //@description:将包含在白名单中的项从path中排除
         let mut to_remove = Vec::<usize>::new();
         for white_item in self.white_list.iter() {
             let (white_selector, white_address) = white_item.split_once(',').unwrap();
@@ -360,7 +363,6 @@ where
 
     #[deprecated(since = "0.2.1", note = "High false alarm rate")]
     fn get_reenter_address_loose(&self, call_trace: CallFrame) -> Vec<String> {
-        //@description:根据执行过程中的调用情况，获得所有被重入的地址
         let mut visited = Path::new();
         let mut reenter_list = Vec::<String>::new();
         Self::dfs(call_trace, &mut visited, &mut reenter_list);
@@ -400,5 +402,53 @@ where
         }
         // 将当前节点删除
         visited.pop();
+    }
+
+    /**
+     * @description:将call_trace中白名单部分去除
+     * @param:call_trace代表交易的call_trace
+     */
+    pub fn exclude_white_in_call_trace(&self, call_trace: &mut CallFrame) {
+        let mut queue = VecDeque::<&mut CallFrame>::new();
+        queue.push_back(call_trace);
+        while let Some(call) = queue.pop_front() {
+            if !call.calls.is_empty() {
+                let mut wait_remove_idx = Vec::new();
+                // 遍历子调用，看是否有相同的函数选择器
+                call.calls.iter().enumerate().for_each(|(idx, sub_call)| {
+                    if sub_call.to.is_some()
+                        && sub_call.input.len() >= 4
+                        && !(sub_call.typ.eq("STATICCALL") || sub_call.typ.eq("SELFDESTRUCT"))
+                    {
+                        let selector = hex::encode(Self::get_selector(&sub_call.input).unwrap())
+                            .to_lowercase();
+                        let address = sub_call.to.unwrap().to_string().to_lowercase();
+                        for white_item in self.white_list.iter() {
+                            let (white_selector, white_address) =
+                                white_item.split_once(',').unwrap();
+                            if white_selector.eq("_") && address.eq(&white_address)
+                                || address.eq(&white_address) && selector.eq(&white_selector)
+                                || white_address.eq("_") && selector.eq(&white_selector)
+                            {
+                                // 从call_trace中删除此次调用
+                                wait_remove_idx.push(idx);
+                            }
+                        }
+                    }
+                });
+                wait_remove_idx.reverse();
+                //从后往前删除
+                for remove_idx in wait_remove_idx.clone() {
+                    let remove_call = call.calls.remove(remove_idx);
+                    if !remove_call.calls.is_empty() {
+                        call.calls.splice(remove_idx..remove_idx, remove_call.calls);
+                    }
+                }
+                // 继续插入
+                for sub_call in call.calls.iter_mut() {
+                    queue.push_back(sub_call);
+                }
+            }
+        }
     }
 }

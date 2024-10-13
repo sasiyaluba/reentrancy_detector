@@ -28,16 +28,5 @@ async fn main() {
     // 实例化检测器
     let detector = ReentrancyDetector::new(ws_provider, WHITE_LIST.clone());
     // 检测
-    // let _ = detector.detect_block().await;
-    let start = time::Instant::now();
-
-    detector
-        .detect_tx(
-            TxHash::from_str("0xee5a17a81800a9493e03164673ac0428347d246aa30cdb124b647787faaabbea")
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let end = time::Instant::now();
-    println!("time used {:?}", end - start);
+    let _ = detector.detect_block().await;
 }
