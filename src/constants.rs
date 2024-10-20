@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
 use alloy::{
-    primitives::I256,
+    primitives::{keccak256, I256, U256},
     rpc::types::trace::geth::{
         GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
         GethDebugTracingOptions, GethDefaultTracingOptions,
@@ -9,8 +9,11 @@ use alloy::{
 };
 use lazy_static::lazy_static;
 use reqwest::header::{HeaderMap, HeaderValue};
+use revm::primitives::B256;
 
 lazy_static! {
+    pub static ref REENTER_EVENT_TOPIC: B256 =
+        B256::from_slice(&keccak256("reenter(address)").to_vec());
     pub static ref WHITE_LIST: Vec<String> = vec![
         format!(
             "_,{}",

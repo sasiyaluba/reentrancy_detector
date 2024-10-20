@@ -1,7 +1,11 @@
-use crate::constants::{CALLTRACE_OPTION, HEADER_MAP, MIN_LOSS, WHITE_LIST};
+use crate::{
+    constants::{CALLTRACE_OPTION, HEADER_MAP, MIN_LOSS, WHITE_LIST},
+    network::{RPCNetwork, RPCNode},
+};
 use alloy::{
     hex::{self, FromHex},
     json_abi::Items,
+    network::Network,
     primitives::{map::HashSet, Address, BlockHash, Bytes, Selector, TxHash, I256, U256},
     providers::{ext::DebugApi, Provider, ProviderBuilder, RootProvider, WsConnect},
     rpc::types::trace::geth::{
@@ -14,7 +18,10 @@ use alloy::{
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use std::{cell::RefCell, collections::VecDeque, rc::Rc, str::FromStr, sync::Arc, time};
+use serde_json::json;
+use std::{
+    cell::RefCell, collections::VecDeque, process::id, rc::Rc, str::FromStr, sync::Arc, time,
+};
 
 type Path = Vec<String>;
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -34,23 +41,29 @@ pub struct BlockSecResponse {
     #[serde(rename = "balanceChanges")]
     balance_changes: Vec<BalanceChange>,
 }
-pub struct ReentrancyDetector<T> {
-    provider: RootProvider<T>,
-    white_list: Vec<String>,
+pub struct ReentrancyDetector {
+    network: RPCNetwork,
+    white_list: Option<Vec<String>>,
+    is_eth: bool,
 }
 pub type AddressProfit = (Address, I256);
-impl<T> ReentrancyDetector<T>
-where
-    T: Transport + Clone,
-{
+impl ReentrancyDetector {
     /**
      * @description:初始化一个重入检测器
      */
-    pub fn new(provider: RootProvider<T>, white_list: Vec<String>) -> Self {
-        Self {
-            provider,
-            white_list,
-        }
+    pub async fn new(
+        network_symbol: RPCNode,
+        is_eth: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Ok(Self {
+            network: RPCNetwork::new_http(network_symbol).await?,
+            white_list: if is_eth {
+                Some(WHITE_LIST.clone())
+            } else {
+                None
+            },
+            is_eth,
+        })
     }
 
     /**
@@ -61,7 +74,8 @@ where
         tx_hash: TxHash,
     ) -> Result<Vec<Address>, Box<dyn std::error::Error>> {
         let trace_info = self
-            .provider
+            .network
+            .rpc_provider
             .debug_trace_transaction(tx_hash, CALLTRACE_OPTION.clone())
             .await?;
         let call_trace = trace_info.try_into_call_frame()?;
@@ -92,7 +106,7 @@ where
      */
     pub async fn detect_block(&self) -> Result<(), Box<dyn std::error::Error>> {
         // 轮询区块头
-        let subscrible_stream = self.provider.watch_blocks().await?;
+        let subscrible_stream = self.network.rpc_provider.watch_blocks().await?;
         let mut stream = subscrible_stream
             .into_stream()
             .flat_map(futures::stream::iter);
@@ -102,30 +116,16 @@ where
             println!("new block");
             let start = time::Instant::now();
             let trace_info = self
-                .provider
+                .network
+                .rpc_provider
                 .debug_trace_block_by_hash(block_hash, CALLTRACE_OPTION.clone())
                 .await?;
             for trace_response in trace_info {
                 match trace_response {
                     TraceResult::Success { result, tx_hash } => {
                         let call_trace = result.try_into_call_frame()?;
-                        let address_list = self.get_reenter_address(call_trace);
-                        // 如果存在重入可能
-                        if !address_list.is_empty() {
-                            let address_profit = self.cacl_balance_change(tx_hash.unwrap()).await?;
-                            // 找出所有盈利的地址，如果盈利超过最小盈利限制，则告警
-                            let profits = address_profit
-                                .into_iter()
-                                .filter(|(_, profit)| profit.lt(&MIN_LOSS))
-                                .collect::<Vec<AddressProfit>>();
-                            for profit in profits {
-                                println!("ALERT!!!");
-                                println!(
-                                    "tx_hash:{:?},address:{},asset balance change:{}USD",
-                                    tx_hash, profit.0, profit.1
-                                );
-                            }
-                        }
+                        self.detect(call_trace, tx_hash.unwrap(), self.is_eth)
+                            .await?;
                     }
                     TraceResult::Error { error, tx_hash } => {
                         return Err(error.into());
@@ -133,7 +133,41 @@ where
                 }
             }
             let end = time::Instant::now();
-            println!("time:{:?}", end - start);
+            println!("timeUsed:{:?}", end - start);
+        }
+        Ok(())
+    }
+
+    /**
+     * @description:内部函数
+     */
+    async fn detect(
+        &self,
+        call_trace: CallFrame,
+        tx_hash: TxHash,
+        is_eth: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let address_list = self.get_reenter_address(call_trace);
+        // 如果存在重入可能
+        if !address_list.is_empty() {
+            if is_eth {
+                let address_profit = self.cacl_balance_change(tx_hash).await?;
+                // 找出所有盈利的地址，如果盈利超过最小盈利限制，则告警
+                let profits = address_profit
+                    .into_iter()
+                    .filter(|(_, profit)| profit.lt(&MIN_LOSS))
+                    .collect::<Vec<AddressProfit>>();
+                for profit in profits {
+                    println!("ALERT!!!");
+                    println!(
+                        "tx_hash:{:?},address:{},asset balance change:{}USD",
+                        tx_hash, profit.0, profit.1
+                    );
+                }
+            } else {
+                println!("ALERT!!!");
+                println!("tx_hash:{:?} maybe reentrancy", tx_hash);
+            }
         }
         Ok(())
     }
@@ -216,9 +250,9 @@ where
         }
         // 第二次过滤：在calltrace中同一子树的同一层找到重入，使用BFS实现
         // !注意，此处可能存在较高误报率
-        // if reenter_list.is_empty() {
-        //     reenter_list.extend(Self::get_reenter_on_same_depth(call_trace));
-        // }
+        if reenter_list.is_empty() {
+            reenter_list.extend(Self::get_reenter_on_same_depth(call_trace));
+        }
         reenter_list
     }
 
@@ -227,43 +261,47 @@ where
      * @param:path代表路径，路径的形式为"selector,address"
      */
     fn get_exclude_address(&self, path: Vec<String>) -> Vec<String> {
-        let mut to_remove = Vec::<usize>::new();
-        for white_item in self.white_list.iter() {
-            let (white_selector, white_address) = white_item.split_once(',').unwrap();
-            if white_selector.eq("_") {
-                // 只需要比较地址
-                for (idx, path_node) in path.iter().enumerate() {
-                    let (_, address) = path_node.split_once(',').unwrap();
-                    if address.eq(white_address) {
-                        to_remove.push(idx);
+        if self.is_eth {
+            let mut to_remove = Vec::<usize>::new();
+            for white_item in self.white_list.as_ref().unwrap().iter() {
+                let (white_selector, white_address) = white_item.split_once(',').unwrap();
+                if white_selector.eq("_") {
+                    // 只需要比较地址
+                    for (idx, path_node) in path.iter().enumerate() {
+                        let (_, address) = path_node.split_once(',').unwrap();
+                        if address.eq(white_address) {
+                            to_remove.push(idx);
+                        }
                     }
-                }
-            } else if white_address.eq("_") {
-                // 只需要比较函数选择器
-                for (idx, path_node) in path.iter().enumerate() {
-                    let (selector, _) = path_node.split_once(',').unwrap();
-                    if selector.eq(white_selector) {
-                        to_remove.push(idx);
+                } else if white_address.eq("_") {
+                    // 只需要比较函数选择器
+                    for (idx, path_node) in path.iter().enumerate() {
+                        let (selector, _) = path_node.split_once(',').unwrap();
+                        if selector.eq(white_selector) {
+                            to_remove.push(idx);
+                        }
                     }
-                }
-            } else {
-                // 正常比较
-                for (idx, path_node) in path.iter().enumerate() {
-                    if path_node.eq(white_item) {
-                        to_remove.push(idx);
+                } else {
+                    // 正常比较
+                    for (idx, path_node) in path.iter().enumerate() {
+                        if path_node.eq(white_item) {
+                            to_remove.push(idx);
+                        }
                     }
                 }
             }
+            let mut set = HashSet::<usize>::new();
+            set.extend(to_remove);
+            let remain_path: Vec<String> = path
+                .into_iter()
+                .enumerate()
+                .filter(|(idx, _)| !set.contains(idx))
+                .map(|(_, value)| value.clone())
+                .collect();
+            remain_path
+        } else {
+            path
         }
-        let mut set = HashSet::<usize>::new();
-        set.extend(to_remove);
-        let remain_path: Vec<String> = path
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| !set.contains(idx))
-            .map(|(_, value)| value.clone())
-            .collect();
-        remain_path
     }
 
     /**
@@ -361,17 +399,17 @@ where
         reenter_list.into_iter().collect()
     }
 
-    #[deprecated(since = "0.2.1", note = "High false alarm rate")]
     fn get_reenter_address_loose(&self, call_trace: CallFrame) -> Vec<String> {
         let mut visited = Path::new();
         let mut reenter_list = Vec::<String>::new();
         Self::dfs(call_trace, &mut visited, &mut reenter_list);
-        let remain_node = self.get_exclude_address(reenter_list);
-        remain_node
+        // let remain_node = self.get_exclude_address(reenter_list);
+        // remain_node
+        reenter_list
     }
     fn dfs(call_trace: CallFrame, visited: &mut Path, alerts: &mut Vec<String>) {
         if call_trace.to.is_some()
-            && !call_trace.input.is_empty()
+            && call_trace.input.len() >= 4
             && !(call_trace.typ.eq("STATICCALL") || call_trace.typ.eq("SELFDESTRUCT"))
         {
             let selector =
@@ -384,6 +422,7 @@ where
             // 有子调用，深度优先遍历
             for sub_call in call_trace.calls {
                 if call_trace.to.is_some()
+                    && call_trace.input.len() >= 4
                     && !(sub_call.typ.eq("STATICCALL") || sub_call.typ.eq("SELFDESTRUCT"))
                 {
                     Self::dfs(sub_call, visited, alerts);
@@ -392,7 +431,6 @@ where
         }
         // 更新告警
         let mut set = HashSet::<&String>::new();
-        println!("visited:{:?}", visited);
 
         for visit in visited.iter() {
             // 有重复项
@@ -412,23 +450,26 @@ where
         let mut queue = VecDeque::<&mut CallFrame>::new();
         queue.push_back(call_trace);
         while let Some(call) = queue.pop_front() {
+            let mut wait_remove_idx = Vec::new();
             if !call.calls.is_empty() {
-                let mut wait_remove_idx = Vec::new();
+                wait_remove_idx.clear();
                 // 遍历子调用，看是否有相同的函数选择器
                 call.calls.iter().enumerate().for_each(|(idx, sub_call)| {
-                    if sub_call.to.is_some()
-                        && sub_call.input.len() >= 4
-                        && !(sub_call.typ.eq("STATICCALL") || sub_call.typ.eq("SELFDESTRUCT"))
-                    {
+                    if sub_call.to.is_some() && sub_call.input.len() >= 4 {
                         let selector = hex::encode(Self::get_selector(&sub_call.input).unwrap())
                             .to_lowercase();
                         let address = sub_call.to.unwrap().to_string().to_lowercase();
-                        for white_item in self.white_list.iter() {
+                        if sub_call.typ.eq("STATICCALL") || sub_call.typ.eq("SELFDESTRUCT") {
+                            wait_remove_idx.push(idx);
+                        }
+                        for white_item in self.white_list.as_ref().unwrap().iter() {
                             let (white_selector, white_address) =
                                 white_item.split_once(',').unwrap();
-                            if white_selector.eq("_") && address.eq(&white_address)
-                                || address.eq(&white_address) && selector.eq(&white_selector)
-                                || white_address.eq("_") && selector.eq(&white_selector)
+
+                            if !wait_remove_idx.contains(&idx)
+                                && ((white_selector.eq("_") && address.eq(&white_address))
+                                    || (address.eq(&white_address) && selector.eq(&white_selector))
+                                    || (white_address.eq("_") && selector.eq(&white_selector)))
                             {
                                 // 从call_trace中删除此次调用
                                 wait_remove_idx.push(idx);
@@ -436,11 +477,16 @@ where
                         }
                     }
                 });
-                wait_remove_idx.reverse();
                 //从后往前删除
-                for remove_idx in wait_remove_idx.clone() {
-                    let remove_call = call.calls.remove(remove_idx);
+                wait_remove_idx.reverse();
+
+                println!("wait_remove_idx {:?}", wait_remove_idx);
+                for remove_idx in wait_remove_idx {
+                    let mut remove_call = call.calls.remove(remove_idx);
                     if !remove_call.calls.is_empty() {
+                        // 在remove_idx之前，插入被删除调用的子调用
+                        // 此处认为：白名单的call之后的delegatecall可能是代理逻辑
+                        remove_call.calls.retain(|sub| !sub.typ.eq("DELEGATECALL"));
                         call.calls.splice(remove_idx..remove_idx, remove_call.calls);
                     }
                 }
@@ -450,5 +496,38 @@ where
                 }
             }
         }
+        // println!("{:?}", serde_json::to_string(&call_trace));
+    }
+
+    pub async fn try_detect(&self, tx_hash: TxHash) -> Result<(), Box<dyn std::error::Error>> {
+        let trace_info = self
+            .network
+            .rpc_provider
+            .debug_trace_transaction(tx_hash, CALLTRACE_OPTION.clone())
+            .await?;
+        let mut call_trace = trace_info.try_into_call_frame()?;
+
+        // 排除白名单内容
+        self.exclude_white_in_call_trace(&mut call_trace);
+        let mut address_list = self.get_reenter_address_loose(call_trace.clone());
+        address_list.extend(Self::get_reenter_on_same_depth(call_trace));
+        // 如果存在重入可能
+        if !address_list.is_empty() {
+            let address_profit = self.cacl_balance_change(tx_hash).await?;
+            // 找出所有盈利的地址，如果盈利超过最小盈利限制，则告警
+            let profits = address_profit
+                .into_iter()
+                .filter(|(_, profit)| profit.lt(&MIN_LOSS))
+                .collect::<Vec<AddressProfit>>();
+            for profit in profits {
+                println!("ALERT!!!");
+                println!(
+                    "tx_hash:{:?},address:{},asset balance change:{} USD",
+                    tx_hash, profit.0, profit.1
+                );
+            }
+        }
+
+        Ok(())
     }
 }
