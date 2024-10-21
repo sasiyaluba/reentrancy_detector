@@ -1,4 +1,2 @@
-pub mod constants;
 pub mod front_run;
-pub mod network;
-pub mod reentrancyDetector;
+pub mod reentrancy_detect;

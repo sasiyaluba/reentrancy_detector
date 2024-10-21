@@ -1,6 +1,6 @@
 use crate::{
-    constants::{CALLTRACE_OPTION, HEADER_MAP, MIN_LOSS, WHITE_LIST},
-    network::{RPCNetwork, RPCNode},
+    reentrancy_detect::constants::{CALLTRACE_OPTION, HEADER_MAP, MIN_LOSS, WHITE_LIST},
+    reentrancy_detect::network::{RPCNetwork, RPCNode},
 };
 use alloy::{
     hex::{self, FromHex},
