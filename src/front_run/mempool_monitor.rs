@@ -25,8 +25,7 @@ impl MempoolMonitor {
             .provider
             .subscribe_pending_transactions()
             .await?
-            .into_stream()
-            .take(3); //todo  delete take3
+            .into_stream();
         while let Some(tx) = stream.next().await {
             println!("pending tx {:?}", tx.to_string());
             let res = self.exectuor.simulate_tx(db, tx.into()).await?;

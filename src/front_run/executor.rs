@@ -15,7 +15,7 @@ use alloy::{
 use anyhow::Result;
 use revm::{
     db::{AlloyDB, CacheDB},
-    primitives::{AccountInfo, Bytecode, ResultAndState, U256},
+    primitives::{AccountInfo, Bytecode, ExecutionResult, ResultAndState, U256},
     Evm,
 };
 
@@ -37,7 +37,7 @@ impl Executor {
         &mut self,
         db: &mut AlloyCacheDB,
         tx_hash: TxHash,
-    ) -> Result<ResultAndState> {
+    ) -> Result<ExecutionResult> {
         self.update_db_with_tx_hash(db, tx_hash).await?;
         let tx = self
             .provider
@@ -61,7 +61,7 @@ impl Executor {
             .with_db(db)
             .build();
         let start = time::Instant::now();
-        let res = evm.transact()?;
+        let res = evm.transact_commit()?;
         let end = time::Instant::now();
         println!("simulate transact use time :{:?}", end - start);
         Ok(res)
@@ -156,10 +156,12 @@ mod test {
             .unwrap();
         let alloydb = AlloyDB::new(client, 21006727.into()).unwrap();
         let mut cache = CacheDB::new(alloydb);
-        executor.simulate_tx(&mut cache, tx_hash).await;
+        let res1 = executor.simulate_tx(&mut cache, tx_hash).await.unwrap();
+        println!("res1 {:?}", res1);
         let tx_hash2: TxHash = "0x100253222d3103d167d32878d97b867b1417244e357539b4426600206fea2668"
             .parse()
             .unwrap();
-        executor.simulate_tx(&mut cache, tx_hash2).await;
+        let res2 = executor.simulate_tx(&mut cache, tx_hash2).await.unwrap();
+        println!("res2 {:?}", res2);
     }
 }
