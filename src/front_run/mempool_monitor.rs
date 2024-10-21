@@ -39,27 +39,13 @@ impl MempoolMonitor {
 mod tests {
     use std::sync::Arc;
 
-    use alloy::{
-        node_bindings::Anvil,
-        providers::{ProviderBuilder, WsConnect},
-    };
+    use alloy::providers::{ProviderBuilder, WsConnect};
     use revm::db::{AlloyDB, CacheDB};
 
     use crate::front_run::mempool_monitor::MempoolMonitor;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 10)]
     async fn test_front_run() {
-        // let anvil = Anvil::new()
-        // .fork("https://lb.drpc.org/ogrpc?network=ethereum&dkey=AvZwUDJNQ0H-rfHFUNlC228dOWBjNHER76RXhkHL9tz4")
-        // .fork_block_number(21006727)
-        // .block_time(1)
-        // .spawn();
-        // let client = Arc::new(
-        //     ProviderBuilder::new()
-        //         .on_ws(WsConnect::new(anvil.ws_endpoint_url()))
-        //         .await
-        //         .unwrap(),
-        // );
         let client = Arc::new(
             ProviderBuilder::new()
                 .on_ws(WsConnect::new(

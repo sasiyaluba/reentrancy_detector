@@ -8,14 +8,17 @@ use alloy::{
     primitives::{Keccak256, TxHash},
     providers::{ext::DebugApi, Provider, RootProvider},
     pubsub::PubSubFrontend,
-    rpc::types::trace::geth::{
-        GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, PreStateFrame,
+    rpc::types::{
+        trace::geth::{
+            GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions, PreStateFrame,
+        },
+        Transaction, TransactionInput, TransactionRequest,
     },
 };
 use anyhow::Result;
 use revm::{
     db::{AlloyDB, CacheDB},
-    primitives::{AccountInfo, Bytecode, ExecutionResult, ResultAndState, U256},
+    primitives::{AccountInfo, Bytecode, Bytes, ExecutionResult, ResultAndState, TxKind, U256},
     Evm,
 };
 
@@ -64,6 +67,32 @@ impl Executor {
         let res = evm.transact_commit()?;
         let end = time::Instant::now();
         println!("simulate transact use time :{:?}", end - start);
+        Ok(res)
+    }
+
+    pub async fn simulate_tx_with_eth_call(&mut self, tx: Transaction) -> Result<Bytes> {
+        let request = TransactionRequest {
+            from: Some(tx.from),
+            to: match tx.to {
+                Some(address) => Some(TxKind::Call(address)),
+                None => Some(TxKind::Create),
+            },
+            value: Some(tx.value),
+            input: TransactionInput::from(tx.input),
+            gas_price: tx.gas_price,
+            max_fee_per_gas: tx.max_fee_per_gas,
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
+            max_fee_per_blob_gas: tx.max_fee_per_blob_gas,
+            gas: Some(tx.gas),
+            nonce: Some(tx.nonce),
+            chain_id: tx.chain_id,
+            access_list: tx.access_list,
+            transaction_type: tx.transaction_type,
+            blob_versioned_hashes: tx.blob_versioned_hashes,
+            sidecar: None,
+            authorization_list: tx.authorization_list,
+        };
+        let res = self.provider.call(&request).await?;
         Ok(res)
     }
 
@@ -126,23 +155,23 @@ impl Executor {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use std::{sync::Arc, time};
 
     use alloy::{
         node_bindings::Anvil,
         primitives::TxHash,
-        providers::{ext::TraceApi, ProviderBuilder, WsConnect},
+        providers::{Provider, ProviderBuilder, WsConnect},
     };
     use revm::db::{AlloyDB, CacheDB};
 
     use crate::front_run::executor::Executor;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_executor() {
+    async fn test_executor_with_revm() {
         let anvil = Anvil::new()
             .fork("https://lb.drpc.org/ogrpc?network=ethereum&dkey=AvZwUDJNQ0H-rfHFUNlC228dOWBjNHER76RXhkHL9tz4")
-            .fork_block_number(21006727)
-            .block_time(1)
+            .fork_block_number(21006726)
+            .block_time(12)
             .spawn();
         let client = Arc::new(
             ProviderBuilder::new()
@@ -150,11 +179,11 @@ mod test {
                 .await
                 .unwrap(),
         );
-        let mut executor = Executor::new(client.clone(), 21006727);
+        let mut executor = Executor::new(client.clone(), 21006726);
         let tx_hash: TxHash = "0x3cb8648d3a66cc7113f52abe09401e054af0e2f04749701e0036e4a564880d43"
             .parse()
             .unwrap();
-        let alloydb = AlloyDB::new(client, 21006727.into()).unwrap();
+        let alloydb = AlloyDB::new(client, 21006726.into()).unwrap();
         let mut cache = CacheDB::new(alloydb);
         let res1 = executor.simulate_tx(&mut cache, tx_hash).await.unwrap();
         println!("res1 {:?}", res1);
@@ -163,5 +192,31 @@ mod test {
             .unwrap();
         let res2 = executor.simulate_tx(&mut cache, tx_hash2).await.unwrap();
         println!("res2 {:?}", res2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+
+    async fn test_executor_with_eth_call() {
+        let anvil = Anvil::new()
+            .fork("https://lb.drpc.org/ogrpc?network=ethereum&dkey=AvZwUDJNQ0H-rfHFUNlC228dOWBjNHER76RXhkHL9tz4")
+            .fork_block_number(21006726)
+            .block_time(12)
+            .spawn();
+        let client = Arc::new(
+            ProviderBuilder::new()
+                .on_ws(WsConnect::new(anvil.ws_endpoint_url()))
+                .await
+                .unwrap(),
+        );
+        let mut executor = Executor::new(client.clone(), 21006726);
+        let tx_hash: TxHash = "0x3cb8648d3a66cc7113f52abe09401e054af0e2f04749701e0036e4a564880d43"
+            .parse()
+            .unwrap();
+        let start = time::Instant::now();
+        let tx = client.get_transaction_by_hash(tx_hash).await.unwrap();
+        let res = executor.simulate_tx_with_eth_call(tx.unwrap()).await;
+        let end = time::Instant::now();
+        println!("eth_call time use {:?}", end - start);
+        println!("{:?}", res);
     }
 }
